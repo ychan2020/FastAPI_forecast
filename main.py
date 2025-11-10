@@ -1,9 +1,9 @@
 # file: main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 import httpx   # async HTTP client (pip install httpx)
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 
 app = FastAPI(
     title="Open-Meteo Forecast Proxy with Geocoding",
@@ -29,7 +29,10 @@ class ForecastParams(BaseModel):
 
 
 @app.get("/geocode", response_class=JSONResponse)
-async def get_geocode(q: str, limit: int = 1):
+async def get_geocode(
+    q: str = Query(..., description="Location to search for"),
+    limit: int = Query(1, ge=1, le=10, description="Number of results to return")
+):
     """
     Geocode a location name to lat/lon using Nominatim (OpenStreetMap).
     Returns the top result(s) as JSON.
@@ -41,15 +44,14 @@ async def get_geocode(q: str, limit: int = 1):
         "q": q,
         "format": "json",
         "limit": limit,
-        "addressdetails": 1,  # Include address details
+        "addressdetails": 1,
     }
 
     url = "https://nominatim.openstreetmap.org/search"
+    headers = {"User-Agent": "FastAPI-Weather-Proxy/0.2.0 (your.email@example.com)"}
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            # Add User-Agent header (required by Nominatim policy)
-            headers = {"User-Agent": "FastAPI-Weather-Proxy/0.2.0 (your.email@example.com)"}
             resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -69,42 +71,58 @@ async def get_geocode(q: str, limit: int = 1):
 
 @app.get("/forecast", response_class=JSONResponse)
 async def get_forecast(
-    latitude: Optional[float] = None,
-    longitude: Optional[float] = None,
-    current: Optional[str] = None,
-    hourly: Optional[str] = None,
+    location: Optional[str] = Query(None, description="City name or address to geocode"),
+    latitude: Optional[float] = Query(None, description="Latitude (if location not used)"),
+    longitude: Optional[float] = Query(None, description="Longitude (if location not used)"),
+    current: Optional[str] = Query(None, description="Comma-separated current weather variables"),
+    hourly: Optional[str] = Query(None, description="Comma-separated hourly variables"),
 ):
     """
-    Proxy the request to Open-Meteo. If 'location' is provided, auto-geocodes to lat/lon.
-    Falls back to explicit lat/lon if provided.
+    Proxy the request to Open-Meteo. 
+    - If `location` is provided → auto-geocode to lat/lon.
+    - Else, require both `latitude` and `longitude`.
     """
-    # Determine lat/lon: prefer geocoding if location given
+    lat = None
+    lon = None
+
+    # Case 1: Use location → geocode
     if location:
-        geocode_params = {"q": location, "limit": 1}
+        geocode_params = {
+            "q": location,
+            "format": "json",
+            "limit": 1,
+            "addressdetails": 1,
+        }
         geocode_url = "https://nominatim.openstreetmap.org/search"
-        headers = {"User-Agent": "FastAPI-Weather-Proxy/0.2.0 (your.email@example.com)"}
+        headers = {"User-Agent": "FastAPI-Weather-Proxy/0.2.0"}
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 resp = await client.get(geocode_url, params=geocode_params, headers=headers)
                 resp.raise_for_status()
                 geocode_data = resp.json()
+
                 if not geocode_data:
                     raise HTTPException(status_code=404, detail=f"No geocoding results for: {location}")
-                
+
                 lat = float(geocode_data[0]["lat"])
                 lon = float(geocode_data[0]["lon"])
-            except (httpx.HTTPStatusError, ValueError) as exc:
-                raise HTTPException(status_code=502, detail=f"Geocoding failed: {exc}")
 
+            except (httpx.HTTPStatusError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail=f"Geocoding failed: {str(exc)}")
+
+    # Case 2: Use explicit latitude/longitude
     elif latitude is not None and longitude is not None:
         lat = latitude
         lon = longitude
     else:
-        raise HTTPException(status_code=400, detail="Provide either 'location' or both 'latitude' and 'longitude'")
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'location' or both 'latitude' and 'longitude'"
+        )
 
-    # Build Open-Meteo params
-    params = {
+    # Build Open-Meteo request
+    params: dict[str, str | float] = {
         "latitude": lat,
         "longitude": lon,
     }
@@ -127,5 +145,4 @@ async def get_forecast(
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Network error: {exc}")
 
-    # Forward the original JSON
     return JSONResponse(content=resp.json())
